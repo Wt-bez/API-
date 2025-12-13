@@ -1,16 +1,319 @@
 # API-дневника
 
-import logging
-from aiogram import Router, F
-from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from datetime import datetime, time, timedelta
-import random
+class User(BaseModel):
+    """Модель пользователя Telegram бота"""
+    user_id: int = Field(..., description="ID пользователя в Telegram")
+    username: Optional[str] = None
+    first_name: str
+    last_name: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.now)
+    language_code: Optional[str] = "ru"
+    
+    class Config:
+        from_attributes = True
 
-from database.manager import db_manager
-from ai.agent import HabitAgent
+        class HabitFrequency(str, Enum):
+    """Частота выполнения привычки"""
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+
+class HabitStatus(str, Enum):
+    """Статус привычки"""
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    ARCHIVED = "archived"
+
+class Habit(BaseModel):
+    """Модель привычки пользователя"""
+    habit_id: int = Field(..., description="ID привычки")
+    user_id: int = Field(..., description="ID пользователя")
+    title: str = Field(..., min_length=3, max_length=100)
+    description: Optional[str] = None
+    is_good: bool = Field(..., description="Полезная или вредная")
+    frequency: HabitFrequency = Field(default=HabitFrequency.DAILY)
+    reminder_time: Optional[time] = None
+    status: HabitStatus = Field(default=HabitStatus.ACTIVE)
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: datetime = Field(default_factory=datetime.now)
+    
+    class Config:
+        from_attributes = True
+
+        logger = logging.getLogger(__name__)
+
+class DatabaseManager:
+    """Менеджер базы данных SQLite"""
+    
+    def __init__(self, db_path: str = "habits.db"):
+        self.db_path = db_path
+        self._init_db()
+    
+    def _get_connection(self):
+        """Получить соединение с БД"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    
+    def _init_db(self):
+        """Инициализация базы данных"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Таблица пользователей
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT NOT NULL,
+                    last_name TEXT,
+                    language_code TEXT DEFAULT 'ru',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Таблица привычек
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS habits (
+                    habit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    is_good BOOLEAN NOT NULL,
+                    frequency TEXT DEFAULT 'daily',
+                    reminder_time TEXT,
+                    status TEXT DEFAULT 'active',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                )
+            ''')
+            
+            # Таблица напоминаний
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS reminders (
+                    reminder_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    habit_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    scheduled_time TIMESTAMP NOT NULL,
+                    sent BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (habit_id) REFERENCES habits (habit_id),
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                )
+            ''')
+            
+            # Таблица заметок (для поиска данных)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS notes (
+                    note_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    tags TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                )
+            ''')
+            
+            # Индексы для быстрого поиска
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_notes_search ON notes(title, content, tags)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_habits_user ON habits(user_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_reminders_time ON reminders(scheduled_time)')
+            
+            conn.commit()
+        logger.info("База данных инициализирована")
+    
+    def add_user(self, user_id: int, username: str, first_name: str, 
+                 last_name: str = None, language_code: str = "ru"):
+        """Добавление пользователя"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR IGNORE INTO users 
+                (user_id, username, first_name, last_name, language_code)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (user_id, username, first_name, last_name, language_code))
+            conn.commit()
+            return cursor.lastrowid
+    
+    def add_habit(self, user_id: int, title: str, is_good: bool, 
+                  description: str = None, frequency: str = "daily", 
+                  reminder_time: str = None):
+        """Добавление привычки"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO habits 
+                (user_id, title, description, is_good, frequency, reminder_time)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (user_id, title, description, is_good, frequency, reminder_time))
+            conn.commit()
+            return cursor.lastrowid
+    
+    def get_user_habits(self, user_id: int, status: str = "active"):
+        """Получение привычек пользователя"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM habits 
+                WHERE user_id = ? AND status = ?
+                ORDER BY created_at DESC
+            ''', (user_id, status))
+            return cursor.fetchall()
+    
+    def get_habit_by_id(self, habit_id: int):
+        """Получение привычки по ID"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM habits WHERE habit_id = ?', (habit_id,))
+            return cursor.fetchone()
+    
+    def add_note(self, user_id: int, title: str, content: str, tags: str = None):
+        """Добавление заметки"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO notes (user_id, title, content, tags)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, title, content, tags))
+            conn.commit()
+            return cursor.lastrowid
+    
+    def search_notes(self, user_id: int, query: str):
+        """Поиск заметок по тексту или тегам"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            search_pattern = f"%{query}%"
+            cursor.execute('''
+                SELECT * FROM notes 
+                WHERE user_id = ? 
+                AND (title LIKE ? OR content LIKE ? OR tags LIKE ?)
+                ORDER BY created_at DESC
+            ''', (user_id, search_pattern, search_pattern, search_pattern))
+            return cursor.fetchall()
+    
+    def get_user_notes(self, user_id: int, limit: int = 50):
+        """Получение всех заметок пользователя"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM notes 
+                WHERE user_id = ? 
+                ORDER BY created_at DESC
+                LIMIT ?
+            ''', (user_id, limit))
+            return cursor.fetchall()
+    
+    def get_note_by_id(self, note_id: int):
+        """Получение заметки по ID"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM notes WHERE note_id = ?', (note_id,))
+            return cursor.fetchone()
+    
+    def update_note(self, note_id: int, title: str = None, content: str = None, tags: str = None):
+        """Обновление заметки"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            updates = []
+            params = []
+            
+            if title is not None:
+                updates.append("title = ?")
+                params.append(title)
+            if content is not None:
+                updates.append("content = ?")
+                params.append(content)
+            if tags is not None:
+                updates.append("tags = ?")
+                params.append(tags)
+            
+            if updates:
+                updates.append("updated_at = CURRENT_TIMESTAMP")
+                params.append(note_id)
+                query = f"UPDATE notes SET {', '.join(updates)} WHERE note_id = ?"
+                cursor.execute(query, params)
+                conn.commit()
+    
+    def delete_note(self, note_id: int):
+        """Удаление заметки"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM notes WHERE note_id = ?', (note_id,))
+            conn.commit()
+    
+    def schedule_reminder(self, habit_id: int, user_id: int, scheduled_time: datetime):
+        """Планирование напоминания"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO reminders (habit_id, user_id, scheduled_time)
+                VALUES (?, ?, ?)
+            ''', (habit_id, user_id, scheduled_time.isoformat()))
+            conn.commit()
+            return cursor.lastrowid
+    
+    def get_pending_reminders(self):
+        """Получение ожидающих напоминаний"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT r.*, h.title, h.description
+                FROM reminders r
+                JOIN habits h ON r.habit_id = h.habit_id
+                WHERE r.sent = FALSE 
+                AND r.scheduled_time <= datetime('now')
+                LIMIT 10
+            ''')
+            return cursor.fetchall()
+    
+    def mark_reminder_sent(self, reminder_id: int):
+        """Отметка напоминания как отправленного"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('UPDATE reminders SET sent = TRUE WHERE reminder_id = ?', (reminder_id,))
+            conn.commit()
+    
+    def get_user_stats(self, user_id: int):
+        """Получение статистики пользователя"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Статистика привычек
+            cursor.execute('''
+                SELECT 
+                    COUNT(*) as total_habits,
+                    SUM(CASE WHEN is_good = 1 THEN 1 ELSE 0 END) as good_habits,
+                    SUM(CASE WHEN is_good = 0 THEN 1 ELSE 0 END) as bad_habits
+                FROM habits 
+                WHERE user_id = ? AND status = 'active'
+            ''', (user_id,))
+            habits_stats = cursor.fetchone()
+            
+            # Статистика заметок
+            cursor.execute('SELECT COUNT(*) as total_notes FROM notes WHERE user_id = ?', (user_id,))
+            notes_stats = cursor.fetchone()
+            
+            return {
+                'total_habits': habits_stats[0] if habits_stats else 0,
+                'good_habits': habits_stats[1] if habits_stats else 0,
+                'bad_habits': habits_stats[2] if habits_stats else 0,
+                'total_notes': notes_stats[0] if notes_stats else 0
+            }
+
+# Создаем глобальный экземпляр менеджера БД
+db_manager = DatabaseManager()
+
+def init_db():
+    """Инициализация базы данных (для main.py)"""
+    return db_manager
+
+    from .manager import DatabaseManager, init_db
+
+__all__ = ['DatabaseManager', 'init_db']
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -378,3 +681,5 @@ async def cmd_help(message: Message):
         "💡 Совет: Используйте теги в заметках для удобного поиска!"
     )
     await message.answer(help_text)7
+
+    
